@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hill Climb Hands</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#87c8eb;font-family:Arial,sans-serif}
+#game{display:block;width:100%;height:100%}
+#cam{position:fixed;top:10px;right:10px;width:240px;height:180px;border:2px solid #fff;border-radius:8px;display:none}
+#vid{position:fixed;left:0;bottom:0;width:160px;height:120px;opacity:0.01;pointer-events:none}
+#menu{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(10,35,55,.82);color:#fff;text-align:center;padding:20px}
+#menu h1{font-size:44px;margin:0 0 10px}
+#menu p{max-width:520px;line-height:1.5;margin:6px 0}
+button{font-size:20px;padding:12px 28px;margin:8px;border:0;border-radius:10px;background:#2e9e43;color:#fff;cursor:pointer}
+button.alt{background:#566}
+#msg{min-height:22px;color:#ffd27a}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<canvas id="cam" width="240" height="180"></canvas>
+<video id="vid" playsinline muted></video>
+<div id="menu">
+  <h1>🏎️ Hill Climb Hands</h1>
+  <p>✋ Open palm = gas &nbsp; ✊ Fist = brake &nbsp; ✌️ Two fingers = coast<br>Tilt your hand left/right to rotate the car in the air.</p>
+  <p>Your webcam video stays in your browser and is never uploaded.</p>
+  <div><button id="bCam">Play with hand gestures</button><button id="bKey" class="alt">Play with keyboard</button></div>
+  <p>Keyboard: → gas, ← brake, A/D tilt, R restart</p>
+  <p id="msg"></p>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/planck-js@0.3.31/dist/planck.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+//PHYS-START
+const pl = planck, PX = 50; // 50 px = 1 m (same scale as the Python version)
+
+function terrainH(xm) {
+  const x = xm * PX, k = Math.min(1, Math.max(0, (x - 200) / 500));
+  const amp = Math.min(40 + x * 0.04, 200);
+  return (100 + k * (0.5 * amp * Math.sin(x / 260) + 0.3 * amp * Math.sin(x / 97 + 1.3))) / PX;
+}
+
+class Game {
+  constructor() {
+    this.world = new pl.World({ gravity: pl.Vec2(0, -18) });
+    this.ground = this.world.createBody();
+    this.chunks = []; this.tx = -6;
+    this.extend(36);
+    this.makeCar(2, 3.2);
+    this.over = false; this.best = 0; this.acc = 0;
+  }
+  extend(xEnd) {
+    while (this.tx < xEnd) {
+      const pts = [];
+      for (let i = 0; i <= 30; i++) { const x = this.tx + i * 0.4; pts.push(pl.Vec2(x, terrainH(x))); }
+      const f = this.ground.createFixture(pl.Chain(pts, false), { friction: 1.5 });
+      this.chunks.push({ f, pts, end: pts[30].x });
+      this.tx += 12;
+    }
+  }
+  prune(xMin) {
+    while (this.chunks.length && this.chunks[0].end < xMin) this.ground.destroyFixture(this.chunks.shift().f);
+  }
+  makeCar(x, y) {
+    const w = this.world;
+    const b = this.body = w.createDynamicBody(pl.Vec2(x, y));
+    b.createFixture(pl.Box(1, 0.2), { density: 2, friction: 0.5, filterGroupIndex: -1 });
+    this.wheels = []; this.joints = [];
+    for (const dx of [-0.76, 0.76]) {
+      const wb = w.createDynamicBody(pl.Vec2(x + dx, y - 0.6));
+      wb.createFixture(pl.Circle(0.36), { density: 0.7, friction: 1.6, filterGroupIndex: -1 });
+      const j = w.createJoint(pl.WheelJoint(
+        { motorSpeed: 0, maxMotorTorque: 0, enableMotor: true, frequencyHz: 4, dampingRatio: 0.7 },
+        b, wb, wb.getPosition(), pl.Vec2(0, 1)));
+      this.wheels.push(wb); this.joints.push(j);
+    }
+  }
+  head() { return this.body.getWorldPoint(pl.Vec2(0.1, 0.48)); }
+  dist() { return this.body.getPosition().x - 2; }
+  step(gas, brake, tilt, dt) {
+    if (this.over) return;
+    for (const j of this.joints) {
+      if (gas) { j.setMotorSpeed(-30); j.setMaxMotorTorque(GAS_TORQUE); }
+      else if (brake) { j.setMotorSpeed(0); j.setMaxMotorTorque(5); }
+      else { j.setMotorSpeed(0); j.setMaxMotorTorque(0); }
+    }
+    this.acc += Math.min(dt, 0.05);
+    while (this.acc >= 1 / 120) {
+      this.body.applyTorque(-tilt * 15, true);
+      this.world.step(1 / 120, 8, 3);
+      this.acc -= 1 / 120;
+    }
+    const h = this.head();
+    if (h.y - 0.18 < terrainH(h.x)) this.over = true;
+    this.best = Math.max(this.best, this.dist());
+    const x = this.body.getPosition().x;
+    this.extend(x + 30); this.prune(x - 18);
+  }
+}
+var GAS_TORQUE = 4;
+//PHYS-END
+
+// ------------------------------------------------------------ input
+const keys = {};
+addEventListener('keydown', e => { keys[e.code] = true; if (e.code === 'KeyR') restart(); if (e.code.startsWith('Arrow')) e.preventDefault(); });
+addEventListener('keyup', e => keys[e.code] = false);
+
+const hand = { gas: false, brake: false, tilt: 0, on: false };
+const cam = document.getElementById('cam'), cctx = cam.getContext('2d'), vid = document.getElementById('vid');
+
+let lastLM = null, lastT = 0;
+function drawCam() {
+  if (!hand.on) return;
+  if (vid.paused) vid.play().catch(() => {});
+  cctx.save(); cctx.translate(240, 0); cctx.scale(-1, 1);
+  cctx.drawImage(vid, 0, 0, 240, 180); cctx.restore();
+  if (lastLM && performance.now() - lastT < 500) {
+    cctx.fillStyle = '#3f3';
+    for (const p of lastLM) { cctx.beginPath(); cctx.arc(p.x * 240, p.y * 180, 3, 0, 7); cctx.fill(); }
+  }
+}
+
+function onResults(res) {
+  lastT = performance.now(); lastLM = null;
+  let gas = false, brake = false, tilt = 0;
+  if (res.multiHandLandmarks && res.multiHandLandmarks.length) {
+    const lm = res.multiHandLandmarks[0].map(p => ({ x: 1 - p.x, y: p.y })); // mirror like a selfie view
+    const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+    let up = 0;
+    for (const [t, p] of [[8, 6], [12, 10], [16, 14], [20, 18]]) if (d(t, 0) > d(p, 0) * 1.1) up++;
+    gas = up >= 3; brake = up <= 1;
+    const ang = Math.atan2(lm[9].x - lm[0].x, lm[0].y - lm[9].y) * 180 / Math.PI;
+    tilt = Math.max(-1, Math.min(1, ang / 45));
+    lastLM = lm;
+  }
+  hand.gas = gas; hand.brake = brake; hand.tilt = tilt;
+}
+
+async function startCamera() {
+  const msg = document.getElementById('msg');
+  msg.textContent = 'Loading hand tracking… allow camera access when asked.';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    vid.srcObject = stream; await vid.play();
+    const hands = new Hands({ locateFile: f => 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/' + f });
+    hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+    hands.onResults(onResults);
+    await hands.initialize();
+    hand.on = true; cam.style.display = 'block';
+    let busy = false;
+    (async function loop() {
+      if (!busy && vid.readyState >= 2) {
+        busy = true;
+        try { await Promise.race([hands.send({ image: vid }), new Promise(r => setTimeout(r, 1500))]); } catch (e) {}
+        busy = false;
+      }
+      requestAnimationFrame(loop);
+    })();
+    return true;
+  } catch (e) {
+    msg.textContent = 'Camera unavailable (' + (e.message || e.name) + '). Using keyboard instead.';
+    return false;
+  }
+}
+
+// ------------------------------------------------------------ rendering
+const canvas = document.getElementById('game'), ctx = canvas.getContext('2d');
+let W, H, ppm;
+function resize() {
+  const r = devicePixelRatio || 1;
+  canvas.width = innerWidth * r; canvas.height = innerHeight * r;
+  W = canvas.width; H = canvas.height; ppm = H / 12;
+}
+addEventListener('resize', resize); resize();
+
+let g = new Game(), started = false;
+function restart() { const b = g.best; g = new Game(); g.best = b; }
+canvas.addEventListener('pointerdown', () => { if (g.over) restart(); });
+
+function draw() {
+  const p = g.body.getPosition();
+  const sx = x => (x - p.x) * ppm + W * 0.3, sy = y => H * 0.6 - (y - p.y) * ppm;
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, '#6ab8e8'); sky.addColorStop(1, '#c9e9f5');
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+  const pts = [];
+  for (const c of g.chunks) for (const q of c.pts) { const x = sx(q.x); if (x > -60 && x < W + 60) pts.push([x, sy(q.y)]); }
+  if (pts.length > 1) {
+    ctx.beginPath(); ctx.moveTo(pts[0][0], H);
+    for (const q of pts) ctx.lineTo(q[0], q[1]);
+    ctx.lineTo(pts[pts.length - 1][0], H); ctx.closePath();
+    ctx.fillStyle = '#5f462d'; ctx.fill();
+    ctx.beginPath(); pts.forEach((q, i) => i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]));
+    ctx.strokeStyle = '#46a03c'; ctx.lineWidth = 0.16 * ppm; ctx.lineJoin = 'round'; ctx.stroke();
+  }
+  ctx.beginPath();
+  [[-1, -0.2], [1, -0.2], [1, 0.2], [-1, 0.2]].forEach(([x, y], i) => {
+    const w = g.body.getWorldPoint(pl.Vec2(x, y));
+    i ? ctx.lineTo(sx(w.x), sy(w.y)) : ctx.moveTo(sx(w.x), sy(w.y));
+  });
+  ctx.closePath(); ctx.fillStyle = '#c82828'; ctx.fill();
+  for (const w of g.wheels) {
+    const c = w.getPosition(), a = w.getAngle(), cx = sx(c.x), cy = sy(c.y), r = 0.36 * ppm;
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.fillStyle = '#191919'; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + r * 0.75 * Math.cos(a), cy - r * 0.75 * Math.sin(a));
+    ctx.strokeStyle = '#ccc'; ctx.lineWidth = 3; ctx.stroke();
+  }
+  const h = g.head();
+  ctx.beginPath(); ctx.arc(sx(h.x), sy(h.y), 0.18 * ppm, 0, 7); ctx.fillStyle = '#fad2a0'; ctx.fill();
+
+  const gas = hand.gas || keys.ArrowRight, brake = hand.brake || keys.ArrowLeft;
+  const status = gas ? 'GAS' : brake ? 'BRAKE' : 'COAST';
+  const fs = Math.round(H / 21);
+  ctx.font = 'bold ' + fs + 'px Arial'; ctx.fillStyle = '#141414'; ctx.textAlign = 'left';
+  ctx.fillText(`${Math.max(0, g.dist()).toFixed(0)} m   best ${g.best.toFixed(0)} m   [${status}]`, 15, fs + 8);
+  if (g.over) {
+    ctx.textAlign = 'center'; ctx.fillStyle = '#b40000';
+    ctx.fillText('CRASHED - press R or tap to retry', W / 2, H / 2 - 60);
+  }
+}
+
+let last = performance.now();
+function frame(t) {
+  const dt = (t - last) / 1000; last = t;
+  drawCam();
+  if (hand.on && performance.now() - lastT > 700) { hand.gas = false; hand.brake = false; hand.tilt = 0; } // lost tracking: coast
+  if (started) {
+    const gas = hand.gas || !!keys.ArrowRight, brake = hand.brake || !!keys.ArrowLeft;
+    const tilt = hand.tilt + (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+    g.step(gas, brake && !gas, Math.max(-1, Math.min(1, tilt)), dt);
+  }
+  draw(); requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+const menu = document.getElementById('menu');
+document.getElementById('bKey').onclick = () => { menu.style.display = 'none'; started = true; };
+document.getElementById('bCam').onclick = async () => { await startCamera(); menu.style.display = 'none'; started = true; };
+</script>
+</body>
+</html>
